@@ -1,0 +1,468 @@
+---
+AWSTemplateFormatVersion: '2010-09-09'
+Description: 'Async Workflow Task SLA monitoring'
+Parameters:
+  MetricsNamespace:
+    Type: "String"
+    Default: "TaskMetrics"
+  ServiceName:
+    Type: "String"
+    Default: "AsyncWorkflow"
+
+Resources:
+  StateMachineAsyncWorkflowLogGroup:
+    Type: AWS::Logs::LogGroup
+    Properties:
+      LogGroupName: /aws/vendedlogs/states/StateMachineAsyncWorkflowLogGroup
+      RetentionInDays: 60
+
+
+  LambdaCloudwatchInvokePermission:
+    Type: AWS::Lambda::Permission
+    Properties:
+      FunctionName: !Ref FunctionWorkflowMetrics
+      Principal: !Sub "logs.${AWS::Region}.amazonaws.com"
+      Action: "lambda:InvokeFunction"
+      SourceArn: !Sub "arn:aws:logs:${AWS::Region}:${AWS::AccountId}:log-group:/aws/vendedlogs/states/StateMachineAsyncWorkflowLogGroup:*"
+
+  StateMachineAsyncWorkflowMonitoringSubscription:
+    Type: AWS::Logs::SubscriptionFilter
+    Properties:
+      LogGroupName: !Ref StateMachineAsyncWorkflowLogGroup
+      FilterPattern: "{$.type = TaskStateExited || $.type = TaskTimedOut || $.type = TaskStateFailed}"
+      DestinationArn: !GetAtt FunctionWorkflowMetrics.Arn
+
+
+  # Step functions state machine
+  StateMachineAsyncWorkflow:
+    Type: 'AWS::StepFunctions::StateMachine'
+    Properties:
+      DefinitionString: !Sub |
+        {
+          "Comment": "AWS Asynchronous Processing Workflow",
+          "StartAt": "Preprocess",
+          "Version": "1.0",
+          "States": {
+            "Preprocess": {
+              "Type": "Task",
+              "Resource": "${FunctionPreprocess.Arn}",
+              "ResultPath": "$.preprocessResult",
+              "Next": "QueueAsync"
+            },
+            "QueueAsync": {
+              "Type": "Task",
+              "Resource": "arn:aws:states:::lambda:invoke.waitForTaskToken",
+              "TimeoutSeconds": 3600,
+              "Parameters" : {
+                "FunctionName": "${FunctionQueueAsync.Arn}",
+                "Payload": {
+                  "input.$": "$.preprocessResult",
+                  "correlationData": {
+                    "taskToken.$": "$$.Task.Token"
+                  }
+                }
+              },
+              "ResultPath": "$.processResult",
+              "Next": "StoreResult"
+            },
+            "StoreResult": {
+              "Type": "Task",
+              "Resource": "${FunctionStoreResult.Arn}",
+              "ResultPath": "$.storeResult",
+              "End": true
+            }
+          }
+        }
+      RoleArn: !GetAtt 'StepFunctionsExecuteLambdaRole.Arn'
+      LoggingConfiguration:
+        IncludeExecutionData: true
+        # https://docs.aws.amazon.com/step-functions/latest/dg/cloudwatch-log-level.html
+        Level: ALL
+        Destinations:
+          - CloudWatchLogsLogGroup:
+              LogGroupArn: !GetAtt StateMachineAsyncWorkflowLogGroup.Arn
+
+
+  # SQS inbound requests for asynchronous processing
+  InboundRequestsQueue:
+    Type: "AWS::SQS::Queue"
+    Properties:
+      QueueName: processing-queue
+      MessageRetentionPeriod: 1209600 # 14 Days (default is 4 days)
+      VisibilityTimeout: 120 # 2 minutes (default is 30 seconds)
+      DelaySeconds: 0 # number of seconds to delay message delivery (default is zero)
+
+  # @see https://docs.aws.amazon.com/AWSCloudFormation/latest/UserGuide/aws-resource-lambda-eventsourcemapping.html#cfn-lambda-eventsourcemapping-eventsourcearn
+  ProcessQueueEventsSubscription:
+    Type: AWS::Lambda::EventSourceMapping
+    Properties:
+      BatchSize: 1
+      Enabled: true
+      EventSourceArn: !GetAtt InboundRequestsQueue.Arn
+      FunctionName: !GetAtt FunctionProcess.Arn
+
+
+  # Lambda functions
+  FunctionPreprocess:
+    Type: 'AWS::Lambda::Function'
+    Properties:
+      FunctionName: Preprocess
+      Code:
+        ZipFile: |
+          import os
+          import boto3
+
+
+          def handler(event, context):
+
+            # do some preprocessing here
+            result = {
+              "foo": "bar"
+            }
+
+            return result
+      Handler: 'index.handler'
+      Role: !GetAtt 'RolePreprocess.Arn'
+      Runtime: 'python3.8'
+
+  FunctionQueueAsync:
+    Type: 'AWS::Lambda::Function'
+    Properties:
+      FunctionName: QueueAsync
+      Handler: 'index.handler'
+      Role: !GetAtt 'RoleQueueAsync.Arn'
+      Runtime: 'python3.8'
+      Timeout: 120
+      Code:
+        ZipFile: |
+          import os
+          import json
+          import boto3
+
+          QUEUE_NAME = os.environ['QUEUE_NAME']
+
+          sqs = boto3.resource('sqs')
+          queue = sqs.get_queue_by_name(QueueName=QUEUE_NAME)
+
+
+          def handler(event, context):
+            # send request to queue for processing
+            queue.send_message(MessageBody=json.dumps(event))
+
+      Environment:
+        Variables:
+          QUEUE_NAME: !GetAtt 'InboundRequestsQueue.QueueName'
+
+  FunctionProcess:
+    Type: 'AWS::Lambda::Function'
+    Properties:
+      FunctionName: Process
+      Timeout: 120
+      Code:
+        ZipFile: |
+          import os
+          import boto3
+          import json
+          import time
+          import random
+
+          client = boto3.client('stepfunctions')
+
+
+          def handler(event, context):
+            for record in event['Records']:
+                event_data = json.loads(record['body'])
+                taskToken = event_data['correlationData']['taskToken']
+                data = event_data['input']
+
+                # simulate long running asynchronous process, sleeping 3-20 seconds
+                duration = random.randrange(3, 21)
+                time.sleep(duration)
+
+                result = {
+                  'input': data,
+                  'duration': duration
+                }
+
+                client.send_task_success(taskToken=taskToken, output=json.dumps(result))
+
+      Handler: 'index.handler'
+      Role: !GetAtt 'RoleProcess.Arn'
+      Runtime: 'python3.8'
+
+  FunctionStoreResult:
+    Type: 'AWS::Lambda::Function'
+    Properties:
+      FunctionName: StoreResult
+      Code:
+        ZipFile: |
+          import os
+          import boto3
+
+
+          def handler(event, context):
+            # storage logic goes here...
+
+            # return result...
+            result = {
+              "success": True
+            }
+
+            return result
+      Handler: 'index.handler'
+      Role: !GetAtt 'RoleStoreResult.Arn'
+      Runtime: 'python3.8'
+
+
+
+
+  FunctionWorkflowMetrics:
+    Type: 'AWS::Lambda::Function'
+    Properties:
+      FunctionName: WorkflowMetrics
+      Handler: 'index.handler'
+      Role: !GetAtt 'RoleWorkflowMetrics.Arn'
+      Runtime: 'python3.8'
+      Timeout: 120
+      Code:
+        ZipFile: |
+          import os
+          import datetime
+          import gzip
+          import base64
+          import boto3
+          import json
+
+          NAMESPACE = os.environ['METRICS_NAMESPACE']
+          SERVICE = os.environ['METRICS_SERVICE']
+
+          cloudwatch = boto3.client('cloudwatch')
+          state_functions = boto3.client('stepfunctions')
+
+          task_events = ['TaskStateExited', 'TaskTimedOut', 'TaskStateFailed']
+
+
+          def get_entry_event(arn, event_id):
+            response = state_functions.get_execution_history(executionArn=arn, reverseOrder=True)
+            for event in response['events']:
+              if int(event['id']) < int(event_id) and event['type'] == 'TaskStateEntered':
+                return event
+
+
+          def process_task_event_metric(event):
+            event_timestamp = int(event['event_timestamp'])
+            entry_event = get_entry_event(event['execution_arn'], event['id'])
+            event_name = entry_event['stateEnteredEventDetails']['name']
+
+            # could not find entry event, exit
+            if entry_event is None:
+              return []
+
+            # metric name is going to be step name + success/failure/abort suffix
+            metric_name = event_name + event['type'].replace('TaskState', '').replace('Task', '')
+            duration = event_timestamp - entry_event['timestamp'].timestamp() * 1000
+
+            # timestamp datetime of when event occurred
+            timestamp = datetime.datetime.fromtimestamp(event_timestamp / 1000.0)
+
+            metrics = [{
+            'MetricName': 'TaskExecutionStatus',
+            'Dimensions': [
+              {
+                'Name': 'TaskExecutionStatus',
+                'Value': metric_name
+              },
+              {
+                'Name': 'Service',
+                'Value': SERVICE
+              }
+
+            ],
+            'Timestamp': timestamp,
+            'Unit': 'Milliseconds',
+            'Value': duration
+          }]
+
+            return metrics
+
+
+          def handler(event, context):
+            # decompress AWS CloudWatch Log event
+            compressed_payload = base64.b64decode(event['awslogs']['data'])
+            uncompressed_payload = gzip.decompress(compressed_payload)
+            payload = json.loads(uncompressed_payload)
+
+            metric_data = []
+            max_metrics_per_batch = 10
+
+            # extract event from log events and generate log data
+            for log_event in payload['logEvents']:
+              log_event_message = json.loads(log_event['message'])
+
+              # skip unsupported events
+              if not log_event_message['type'] in task_events:
+                continue
+
+              event_metrics = process_task_event_metric(log_event_message)
+
+              for metric in event_metrics:
+                metric_data.append(metric)
+
+                # reached batch size, flush
+                if len(metric_data) >= max_metrics_per_batch:
+                  cloudwatch.put_metric_data(MetricData=metric_data, Namespace=NAMESPACE)
+                  metric_data = []
+
+            # flush remainder
+            if len(metric_data) > 0:
+              cloudwatch.put_metric_data(MetricData=metric_data, Namespace=NAMESPACE)
+      Environment:
+        Variables:
+          METRICS_NAMESPACE: !Ref MetricsNamespace
+          METRICS_SERVICE: !Ref ServiceName
+
+
+  # IAM roles
+  StepFunctionsExecuteLambdaRole:
+    Type: 'AWS::IAM::Role'
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+        - Effect: Allow
+          Principal:
+            Service: !Sub 'states.${AWS::Region}.amazonaws.com'
+          Action: 'sts:AssumeRole'
+      Policies:
+      - PolicyName: lambda
+        PolicyDocument:
+          Statement:
+          - Effect: Allow
+            Action: 'lambda:InvokeFunction'
+            Resource:
+            - !GetAtt 'FunctionPreprocess.Arn'
+            - !GetAtt 'FunctionQueueAsync.Arn'
+            - !GetAtt 'FunctionStoreResult.Arn'
+          - Effect: Allow
+            Action:
+              - 'logs:CreateLogDelivery'
+              - 'logs:GetLogDelivery'
+              - 'logs:UpdateLogDelivery'
+              - 'logs:DeleteLogDelivery'
+              - 'logs:ListLogDeliveries'
+              - 'logs:PutResourcePolicy'
+              - 'logs:DescribeResourcePolicies'
+              - 'logs:DescribeLogGroups'
+            Resource:
+              - !GetAtt 'StateMachineAsyncWorkflowLogGroup.Arn'
+              - "*"
+
+  RolePreprocess:
+    Type: 'AWS::IAM::Role'
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+        - Effect: Allow
+          Principal:
+            Service: 'lambda.amazonaws.com'
+          Action: 'sts:AssumeRole'
+      ManagedPolicyArns:
+      - 'arn:aws:iam::aws:policy/service-role/AWSLambdaBasicExecutionRole'
+
+  RoleQueueAsync:
+    Type: 'AWS::IAM::Role'
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+        - Effect: Allow
+          Principal:
+            Service: 'lambda.amazonaws.com'
+          Action: 'sts:AssumeRole'
+      ManagedPolicyArns:
+      - 'arn:aws:iam::aws:policy/service-role/AWSLambdaBasicExecutionRole'
+      Policies:
+        - PolicyName: QueueForProcessPolicy
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: "Allow"
+                Action:
+                  - "sqs:SendMessage"
+                  - "sqs:GetQueueUrl"
+                Resource: !GetAtt 'InboundRequestsQueue.Arn'
+
+  RoleProcess:
+    Type: 'AWS::IAM::Role'
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: 'lambda.amazonaws.com'
+            Action: 'sts:AssumeRole'
+      ManagedPolicyArns:
+        - 'arn:aws:iam::aws:policy/service-role/AWSLambdaBasicExecutionRole'
+      Policies:
+        - PolicyName: ProcessPolicy
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: "Allow"
+                Action:
+                  - "states:SendTaskSuccess"
+                  - "states:SendTaskFailure"
+                  - "states:SendTaskHeartbeat"
+                Resource: "*"
+              - Effect: "Allow"
+                Action:
+                  - "sqs:ReceiveMessage"
+                  - "sqs:DeleteMessage"
+                  - "sqs:GetQueueAttributes"
+                Resource: !GetAtt 'InboundRequestsQueue.Arn'
+
+  RoleStoreResult:
+    Type: 'AWS::IAM::Role'
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: 'lambda.amazonaws.com'
+            Action: 'sts:AssumeRole'
+      ManagedPolicyArns:
+        - 'arn:aws:iam::aws:policy/service-role/AWSLambdaBasicExecutionRole'
+
+
+  RoleWorkflowMetrics:
+    Type: 'AWS::IAM::Role'
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: 'lambda.amazonaws.com'
+            Action: 'sts:AssumeRole'
+      ManagedPolicyArns:
+        - 'arn:aws:iam::aws:policy/service-role/AWSLambdaBasicExecutionRole'
+      Policies:
+        - PolicyName: WorkflowMetricsPolicy
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+            - Effect: Allow
+              Action:
+                - cloudwatch:PutMetricData
+              Resource: "*"
+            - Effect: Allow
+              Action:
+                - states:GetExecutionHistory
+              Resource: !Join
+                - ':'
+                - - !Sub 'arn:aws:states:${AWS::Region}:${AWS::AccountId}:execution'
+                  - !GetAtt StateMachineAsyncWorkflow.Name
+                  - '*'
