@@ -31,6 +31,7 @@ Resources:
       LogGroupName: !Ref StateMachineAsyncWorkflowLogGroup
       FilterPattern: "{$.type = TaskStateExited || $.type = TaskTimedOut || $.type = TaskStateFailed}"
       DestinationArn: !GetAtt FunctionWorkflowMetrics.Arn
+    DependsOn: LambdaCloudwatchInvokePermission
 
 
   # Step functions state machine
