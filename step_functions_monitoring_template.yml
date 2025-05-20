@@ -124,7 +124,7 @@ Resources:
             return result
       Handler: 'index.handler'
       Role: !GetAtt 'RolePreprocess.Arn'
-      Runtime: 'python3.8'
+      Runtime: 'python3.13'
 
   FunctionQueueAsync:
     Type: 'AWS::Lambda::Function'
@@ -132,7 +132,7 @@ Resources:
       FunctionName: QueueAsync
       Handler: 'index.handler'
       Role: !GetAtt 'RoleQueueAsync.Arn'
-      Runtime: 'python3.8'
+      Runtime: 'python3.13'
       Timeout: 120
       Code:
         ZipFile: |
@@ -189,7 +189,7 @@ Resources:
 
       Handler: 'index.handler'
       Role: !GetAtt 'RoleProcess.Arn'
-      Runtime: 'python3.8'
+      Runtime: 'python3.13'
 
   FunctionStoreResult:
     Type: 'AWS::Lambda::Function'
@@ -212,7 +212,7 @@ Resources:
             return result
       Handler: 'index.handler'
       Role: !GetAtt 'RoleStoreResult.Arn'
-      Runtime: 'python3.8'
+      Runtime: 'python3.13'
 
 
 
@@ -223,7 +223,7 @@ Resources:
       FunctionName: WorkflowMetrics
       Handler: 'index.handler'
       Role: !GetAtt 'RoleWorkflowMetrics.Arn'
-      Runtime: 'python3.8'
+      Runtime: 'python3.13'
       Timeout: 120
       Code:
         ZipFile: |
